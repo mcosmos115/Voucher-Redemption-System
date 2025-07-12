@@ -7,6 +7,7 @@
 (define-constant ERR_INSUFFICIENT_BALANCE (err u105))
 (define-constant ERR_PRODUCT_NOT_FOUND (err u106))
 (define-constant ERR_PRODUCT_OUT_OF_STOCK (err u107))
+(define-constant ERR_BATCH_SIZE_EXCEEDED (err u108))
 
 (define-data-var voucher-counter uint u0)
 (define-data-var product-counter uint u0)
@@ -246,5 +247,99 @@
       { voucher-ids: (unwrap! (as-max-len? (append new-owner-vouchers voucher-id) u100) ERR_INSUFFICIENT_BALANCE) }
     )
     (ok true)
+  )
+)
+
+(define-public (batch-issue-vouchers (recipients (list 10 principal)) (product-id uint) (value uint) (validity-blocks uint))
+  (let
+    (
+      (batch-size (len recipients))
+      (starting-counter (var-get voucher-counter))
+      (result (fold batch-issue-voucher-helper recipients {
+        product-id: product-id,
+        value: value,
+        validity-blocks: validity-blocks,
+        counter: starting-counter,
+        issued-ids: (list)
+      }))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> value u0) ERR_INVALID_AMOUNT)
+    (asserts! (> validity-blocks u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-some (get-product product-id)) ERR_PRODUCT_NOT_FOUND)
+    (asserts! (<= batch-size u10) ERR_BATCH_SIZE_EXCEEDED)
+    (ok (get issued-ids result))
+  )
+)
+
+(define-private (batch-issue-voucher-helper (recipient principal) (state { product-id: uint, value: uint, validity-blocks: uint, counter: uint, issued-ids: (list 10 uint) }))
+  (let
+    (
+      (new-voucher-id (+ (get counter state) u1))
+      (expiry-block (+ stacks-block-height (get validity-blocks state)))
+      (current-vouchers (get voucher-ids (get-user-vouchers recipient)))
+    )
+    (map-set vouchers
+      { voucher-id: new-voucher-id }
+      {
+        owner: recipient,
+        product-id: (get product-id state),
+        value: (get value state),
+        expiry-block: expiry-block,
+        redeemed: false,
+        redeemed-at: none,
+        created-at: stacks-block-height
+      }
+    )
+    (map-set user-vouchers
+      { user: recipient }
+      { voucher-ids: (unwrap-panic (as-max-len? (append current-vouchers new-voucher-id) u100)) }
+    )
+    (var-set voucher-counter new-voucher-id)
+    {
+      product-id: (get product-id state),
+      value: (get value state),
+      validity-blocks: (get validity-blocks state),
+      counter: new-voucher-id,
+      issued-ids: (unwrap-panic (as-max-len? (append (get issued-ids state) new-voucher-id) u10))
+    }
+  )
+)
+
+(define-public (batch-redeem-vouchers (voucher-ids (list 5 uint)))
+  (let
+    (
+      (batch-size (len voucher-ids))
+    )
+    (asserts! (<= batch-size u5) ERR_BATCH_SIZE_EXCEEDED)
+    (ok (fold batch-redeem-voucher-helper voucher-ids { success-count: u0, failed-count: u0 }))
+  )
+)
+
+(define-private (batch-redeem-voucher-helper (voucher-id uint) (state { success-count: uint, failed-count: uint }))
+  (match (redeem-voucher voucher-id)
+    success-result
+    { success-count: (+ (get success-count state) u1), failed-count: (get failed-count state) }
+    error-result
+    { success-count: (get success-count state), failed-count: (+ (get failed-count state) u1) }
+  )
+)
+
+(define-public (batch-transfer-vouchers (voucher-data (list 5 { voucher-id: uint, new-owner: principal })))
+  (let
+    (
+      (batch-size (len voucher-data))
+    )
+    (asserts! (<= batch-size u5) ERR_BATCH_SIZE_EXCEEDED)
+    (ok (fold batch-transfer-voucher-helper voucher-data { success-count: u0, failed-count: u0 }))
+  )
+)
+
+(define-private (batch-transfer-voucher-helper (transfer-data { voucher-id: uint, new-owner: principal }) (state { success-count: uint, failed-count: uint }))
+  (match (transfer-voucher (get voucher-id transfer-data) (get new-owner transfer-data))
+    success-result
+    { success-count: (+ (get success-count state) u1), failed-count: (get failed-count state) }
+    error-result
+    { success-count: (get success-count state), failed-count: (+ (get failed-count state) u1) }
   )
 )
