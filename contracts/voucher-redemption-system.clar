@@ -8,6 +8,9 @@
 (define-constant ERR_PRODUCT_NOT_FOUND (err u106))
 (define-constant ERR_PRODUCT_OUT_OF_STOCK (err u107))
 (define-constant ERR_BATCH_SIZE_EXCEEDED (err u108))
+(define-constant ERR_VOUCHER_ALREADY_STAKED (err u109))
+(define-constant ERR_VOUCHER_NOT_STAKED (err u110))
+(define-constant ERR_STAKING_PERIOD_NOT_COMPLETE (err u111))
 
 (define-data-var voucher-counter uint u0)
 (define-data-var product-counter uint u0)
@@ -52,6 +55,22 @@
   }
 )
 
+(define-map staked-vouchers
+  { voucher-id: uint }
+  {
+    staker: principal,
+    staked-at: uint,
+    unlock-block: uint,
+    original-value: uint,
+    reward-rate: uint
+  }
+)
+
+(define-map user-staked-vouchers
+  { user: principal }
+  { staked-voucher-ids: (list 50 uint) }
+)
+
 (define-read-only (get-voucher (voucher-id uint))
   (map-get? vouchers { voucher-id: voucher-id })
 )
@@ -66,6 +85,33 @@
 
 (define-read-only (get-redemption-history (voucher-id uint))
   (map-get? redemption-history { voucher-id: voucher-id })
+)
+
+(define-read-only (get-staked-voucher (voucher-id uint))
+  (map-get? staked-vouchers { voucher-id: voucher-id })
+)
+
+(define-read-only (get-user-staked-vouchers (user principal))
+  (default-to { staked-voucher-ids: (list) } (map-get? user-staked-vouchers { user: user }))
+)
+
+(define-read-only (calculate-staking-reward (voucher-id uint))
+  (match (get-staked-voucher voucher-id)
+    stake-data
+    (let
+      (
+        (blocks-staked (- stacks-block-height (get staked-at stake-data)))
+        (reward-multiplier (/ (* blocks-staked (get reward-rate stake-data)) u10000))
+        (reward-amount (/ (* (get original-value stake-data) reward-multiplier) u100))
+      )
+      (some (+ (get original-value stake-data) reward-amount))
+    )
+    none
+  )
+)
+
+(define-read-only (is-voucher-staked (voucher-id uint))
+  (is-some (get-staked-voucher voucher-id))
 )
 
 (define-read-only (get-voucher-counter)
@@ -341,5 +387,72 @@
     { success-count: (+ (get success-count state) u1), failed-count: (get failed-count state) }
     error-result
     { success-count: (get success-count state), failed-count: (+ (get failed-count state) u1) }
+  )
+)
+
+(define-public (stake-voucher (voucher-id uint) (staking-blocks uint))
+  (let
+    (
+      (voucher-data (unwrap! (get-voucher voucher-id) ERR_VOUCHER_NOT_FOUND))
+      (reward-rate u25)
+      (current-staked-vouchers (get staked-voucher-ids (get-user-staked-vouchers tx-sender)))
+    )
+    (asserts! (is-eq tx-sender (get owner voucher-data)) ERR_UNAUTHORIZED)
+    (asserts! (not (get redeemed voucher-data)) ERR_VOUCHER_ALREADY_REDEEMED)
+    (asserts! (> (get expiry-block voucher-data) stacks-block-height) ERR_VOUCHER_EXPIRED)
+    (asserts! (not (is-voucher-staked voucher-id)) ERR_VOUCHER_ALREADY_STAKED)
+    (asserts! (> staking-blocks u0) ERR_INVALID_AMOUNT)
+    (map-set staked-vouchers
+      { voucher-id: voucher-id }
+      {
+        staker: tx-sender,
+        staked-at: stacks-block-height,
+        unlock-block: (+ stacks-block-height staking-blocks),
+        original-value: (get value voucher-data),
+        reward-rate: reward-rate
+      }
+    )
+    (map-set user-staked-vouchers
+      { user: tx-sender }
+      { staked-voucher-ids: (unwrap! (as-max-len? (append current-staked-vouchers voucher-id) u50) ERR_INSUFFICIENT_BALANCE) }
+    )
+    (ok true)
+  )
+)
+
+(define-public (unstake-voucher (voucher-id uint))
+  (let
+    (
+      (stake-data (unwrap! (get-staked-voucher voucher-id) ERR_VOUCHER_NOT_STAKED))
+      (voucher-data (unwrap! (get-voucher voucher-id) ERR_VOUCHER_NOT_FOUND))
+      (new-value (unwrap! (calculate-staking-reward voucher-id) ERR_VOUCHER_NOT_STAKED))
+    )
+    (asserts! (is-eq tx-sender (get staker stake-data)) ERR_UNAUTHORIZED)
+    (asserts! (>= stacks-block-height (get unlock-block stake-data)) ERR_STAKING_PERIOD_NOT_COMPLETE)
+    (map-delete staked-vouchers { voucher-id: voucher-id })
+    (map-set vouchers
+      { voucher-id: voucher-id }
+      (merge voucher-data { value: new-value })
+    )
+    (ok new-value)
+  )
+)
+
+(define-public (emergency-unstake (voucher-id uint))
+  (let
+    (
+      (stake-data (unwrap! (get-staked-voucher voucher-id) ERR_VOUCHER_NOT_STAKED))
+      (voucher-data (unwrap! (get-voucher voucher-id) ERR_VOUCHER_NOT_FOUND))
+      (penalty-rate u10)
+      (penalty-amount (/ (* (get original-value stake-data) penalty-rate) u100))
+      (penalized-value (- (get original-value stake-data) penalty-amount))
+    )
+    (asserts! (is-eq tx-sender (get staker stake-data)) ERR_UNAUTHORIZED)
+    (map-delete staked-vouchers { voucher-id: voucher-id })
+    (map-set vouchers
+      { voucher-id: voucher-id }
+      (merge voucher-data { value: penalized-value })
+    )
+    (ok penalized-value)
   )
 )
