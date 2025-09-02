@@ -11,9 +11,13 @@
 (define-constant ERR_VOUCHER_ALREADY_STAKED (err u109))
 (define-constant ERR_VOUCHER_NOT_STAKED (err u110))
 (define-constant ERR_STAKING_PERIOD_NOT_COMPLETE (err u111))
+(define-constant ERR_VOUCHER_NOT_FOR_SALE (err u112))
+(define-constant ERR_CANNOT_BUY_OWN_VOUCHER (err u113))
+(define-constant ERR_MARKETPLACE_FEE_FAILED (err u114))
 
 (define-data-var voucher-counter uint u0)
 (define-data-var product-counter uint u0)
+(define-data-var marketplace-fee-rate uint u300)
 
 (define-map vouchers
   { voucher-id: uint }
@@ -71,6 +75,30 @@
   { staked-voucher-ids: (list 50 uint) }
 )
 
+(define-map marketplace-listings
+  { voucher-id: uint }
+  {
+    seller: principal,
+    price: uint,
+    listed-at: uint,
+    active: bool
+  }
+)
+
+(define-map trade-history
+  { trade-id: uint }
+  {
+    voucher-id: uint,
+    seller: principal,
+    buyer: principal,
+    price: uint,
+    traded-at: uint,
+    fee-paid: uint
+  }
+)
+
+(define-data-var trade-counter uint u0)
+
 (define-read-only (get-voucher (voucher-id uint))
   (map-get? vouchers { voucher-id: voucher-id })
 )
@@ -112,6 +140,25 @@
 
 (define-read-only (is-voucher-staked (voucher-id uint))
   (is-some (get-staked-voucher voucher-id))
+)
+
+(define-read-only (get-marketplace-listing (voucher-id uint))
+  (map-get? marketplace-listings { voucher-id: voucher-id })
+)
+
+(define-read-only (get-trade-history (trade-id uint))
+  (map-get? trade-history { trade-id: trade-id })
+)
+
+(define-read-only (get-marketplace-fee-rate)
+  (var-get marketplace-fee-rate)
+)
+
+(define-read-only (is-voucher-listed (voucher-id uint))
+  (match (get-marketplace-listing voucher-id)
+    listing-data (get active listing-data)
+    false
+  )
 )
 
 (define-read-only (get-voucher-counter)
@@ -454,5 +501,97 @@
       (merge voucher-data { value: penalized-value })
     )
     (ok penalized-value)
+  )
+)
+
+(define-public (list-voucher-for-sale (voucher-id uint) (price uint))
+  (let
+    (
+      (voucher-data (unwrap! (get-voucher voucher-id) ERR_VOUCHER_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner voucher-data)) ERR_UNAUTHORIZED)
+    (asserts! (not (get redeemed voucher-data)) ERR_VOUCHER_ALREADY_REDEEMED)
+    (asserts! (> (get expiry-block voucher-data) stacks-block-height) ERR_VOUCHER_EXPIRED)
+    (asserts! (not (is-voucher-staked voucher-id)) ERR_VOUCHER_ALREADY_STAKED)
+    (asserts! (not (is-voucher-listed voucher-id)) ERR_VOUCHER_ALREADY_STAKED)
+    (asserts! (> price u0) ERR_INVALID_AMOUNT)
+    (map-set marketplace-listings
+      { voucher-id: voucher-id }
+      {
+        seller: tx-sender,
+        price: price,
+        listed-at: stacks-block-height,
+        active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-listing (voucher-id uint))
+  (let
+    (
+      (listing-data (unwrap! (get-marketplace-listing voucher-id) ERR_VOUCHER_NOT_FOR_SALE))
+    )
+    (asserts! (is-eq tx-sender (get seller listing-data)) ERR_UNAUTHORIZED)
+    (asserts! (get active listing-data) ERR_VOUCHER_NOT_FOR_SALE)
+    (map-set marketplace-listings
+      { voucher-id: voucher-id }
+      (merge listing-data { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (buy-voucher (voucher-id uint))
+  (let
+    (
+      (listing-data (unwrap! (get-marketplace-listing voucher-id) ERR_VOUCHER_NOT_FOR_SALE))
+      (voucher-data (unwrap! (get-voucher voucher-id) ERR_VOUCHER_NOT_FOUND))
+      (sale-price (get price listing-data))
+      (fee-amount (/ (* sale-price (var-get marketplace-fee-rate)) u10000))
+      (seller-amount (- sale-price fee-amount))
+      (new-trade-id (+ (var-get trade-counter) u1))
+      (current-buyer-vouchers (get voucher-ids (get-user-vouchers tx-sender)))
+    )
+    (asserts! (get active listing-data) ERR_VOUCHER_NOT_FOR_SALE)
+    (asserts! (not (is-eq tx-sender (get seller listing-data))) ERR_CANNOT_BUY_OWN_VOUCHER)
+    (asserts! (not (get redeemed voucher-data)) ERR_VOUCHER_ALREADY_REDEEMED)
+    (asserts! (> (get expiry-block voucher-data) stacks-block-height) ERR_VOUCHER_EXPIRED)
+    (try! (stx-transfer? sale-price tx-sender (get seller listing-data)))
+    (map-set vouchers
+      { voucher-id: voucher-id }
+      (merge voucher-data { owner: tx-sender })
+    )
+    (map-set user-vouchers
+      { user: tx-sender }
+      { voucher-ids: (unwrap! (as-max-len? (append current-buyer-vouchers voucher-id) u100) ERR_INSUFFICIENT_BALANCE) }
+    )
+    (map-set marketplace-listings
+      { voucher-id: voucher-id }
+      (merge listing-data { active: false })
+    )
+    (map-set trade-history
+      { trade-id: new-trade-id }
+      {
+        voucher-id: voucher-id,
+        seller: (get seller listing-data),
+        buyer: tx-sender,
+        price: sale-price,
+        traded-at: stacks-block-height,
+        fee-paid: fee-amount
+      }
+    )
+    (var-set trade-counter new-trade-id)
+    (ok true)
+  )
+)
+
+(define-public (update-marketplace-fee (new-fee-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-fee-rate u1000) ERR_INVALID_AMOUNT)
+    (var-set marketplace-fee-rate new-fee-rate)
+    (ok true)
   )
 )
