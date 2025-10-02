@@ -14,10 +14,14 @@
 (define-constant ERR_VOUCHER_NOT_FOR_SALE (err u112))
 (define-constant ERR_CANNOT_BUY_OWN_VOUCHER (err u113))
 (define-constant ERR_MARKETPLACE_FEE_FAILED (err u114))
+(define-constant ERR_ALREADY_REFERRED (err u115))
+(define-constant ERR_CANNOT_SELF_REFER (err u116))
+(define-constant ERR_NO_REWARDS_AVAILABLE (err u117))
 
 (define-data-var voucher-counter uint u0)
 (define-data-var product-counter uint u0)
 (define-data-var marketplace-fee-rate uint u300)
+(define-data-var referral-reward-rate uint u500)
 
 (define-map vouchers
   { voucher-id: uint }
@@ -99,6 +103,33 @@
 
 (define-data-var trade-counter uint u0)
 
+(define-map referrals
+  { referee: principal }
+  {
+    referrer: principal,
+    joined-at: uint,
+    total-rewards-earned: uint
+  }
+)
+
+(define-map referrer-stats
+  { referrer: principal }
+  {
+    total-referrals: uint,
+    pending-rewards: uint,
+    claimed-rewards: uint
+  }
+)
+
+(define-map referral-activity
+  { referee: principal, activity-type: (string-ascii 20) }
+  {
+    referrer: principal,
+    reward-amount: uint,
+    activity-at: uint
+  }
+)
+
 (define-read-only (get-voucher (voucher-id uint))
   (map-get? vouchers { voucher-id: voucher-id })
 )
@@ -159,6 +190,19 @@
     listing-data (get active listing-data)
     false
   )
+)
+
+(define-read-only (get-referral (referee principal))
+  (map-get? referrals { referee: referee })
+)
+
+(define-read-only (get-referrer-stats (referrer principal))
+  (default-to { total-referrals: u0, pending-rewards: u0, claimed-rewards: u0 }
+    (map-get? referrer-stats { referrer: referrer }))
+)
+
+(define-read-only (get-referral-reward-rate)
+  (var-get referral-reward-rate)
 )
 
 (define-read-only (get-voucher-counter)
@@ -592,6 +636,181 @@
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
     (asserts! (<= new-fee-rate u1000) ERR_INVALID_AMOUNT)
     (var-set marketplace-fee-rate new-fee-rate)
+    (ok true)
+  )
+)
+
+(define-public (register-with-referrer (referrer principal))
+  (begin
+    (asserts! (not (is-eq tx-sender referrer)) ERR_CANNOT_SELF_REFER)
+    (asserts! (is-none (get-referral tx-sender)) ERR_ALREADY_REFERRED)
+    (map-set referrals
+      { referee: tx-sender }
+      {
+        referrer: referrer,
+        joined-at: stacks-block-height,
+        total-rewards-earned: u0
+      }
+    )
+    (let
+      (
+        (current-stats (get-referrer-stats referrer))
+      )
+      (map-set referrer-stats
+        { referrer: referrer }
+        {
+          total-referrals: (+ (get total-referrals current-stats) u1),
+          pending-rewards: (get pending-rewards current-stats),
+          claimed-rewards: (get claimed-rewards current-stats)
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-private (process-referral-reward (referee principal) (reward-base uint) (activity-type (string-ascii 20)))
+  (match (get-referral referee)
+    referral-data
+    (let
+      (
+        (referrer (get referrer referral-data))
+        (reward-amount (/ (* reward-base (var-get referral-reward-rate)) u10000))
+        (current-referrer-stats (get-referrer-stats referrer))
+      )
+      (map-set referrer-stats
+        { referrer: referrer }
+        {
+          total-referrals: (get total-referrals current-referrer-stats),
+          pending-rewards: (+ (get pending-rewards current-referrer-stats) reward-amount),
+          claimed-rewards: (get claimed-rewards current-referrer-stats)
+        }
+      )
+      (map-set referrals
+        { referee: referee }
+        (merge referral-data { total-rewards-earned: (+ (get total-rewards-earned referral-data) reward-amount) })
+      )
+      (map-set referral-activity
+        { referee: referee, activity-type: activity-type }
+        {
+          referrer: referrer,
+          reward-amount: reward-amount,
+          activity-at: stacks-block-height
+        }
+      )
+      true
+    )
+    false
+  )
+)
+
+(define-public (redeem-voucher-with-referral (voucher-id uint))
+  (let
+    (
+      (voucher-data (unwrap! (get-voucher voucher-id) ERR_VOUCHER_NOT_FOUND))
+      (product-data (unwrap! (get-product (get product-id voucher-data)) ERR_PRODUCT_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner voucher-data)) ERR_UNAUTHORIZED)
+    (asserts! (not (get redeemed voucher-data)) ERR_VOUCHER_ALREADY_REDEEMED)
+    (asserts! (> (get expiry-block voucher-data) stacks-block-height) ERR_VOUCHER_EXPIRED)
+    (asserts! (get active product-data) ERR_PRODUCT_NOT_FOUND)
+    (asserts! (> (get stock product-data) u0) ERR_PRODUCT_OUT_OF_STOCK)
+    (asserts! (>= (get value voucher-data) (get price product-data)) ERR_INSUFFICIENT_BALANCE)
+    (process-referral-reward tx-sender (get value voucher-data) "redemption")
+    (map-set vouchers
+      { voucher-id: voucher-id }
+      (merge voucher-data {
+        redeemed: true,
+        redeemed-at: (some stacks-block-height)
+      })
+    )
+    (map-set products
+      { product-id: (get product-id voucher-data) }
+      (merge product-data { stock: (- (get stock product-data) u1) })
+    )
+    (map-set redemption-history
+      { voucher-id: voucher-id }
+      {
+        redeemed-by: tx-sender,
+        product-id: (get product-id voucher-data),
+        redeemed-at: stacks-block-height,
+        transaction-hash: 0x0000000000000000000000000000000000000000000000000000000000000000
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (buy-voucher-with-referral (voucher-id uint))
+  (let
+    (
+      (listing-data (unwrap! (get-marketplace-listing voucher-id) ERR_VOUCHER_NOT_FOR_SALE))
+      (voucher-data (unwrap! (get-voucher voucher-id) ERR_VOUCHER_NOT_FOUND))
+      (sale-price (get price listing-data))
+      (fee-amount (/ (* sale-price (var-get marketplace-fee-rate)) u10000))
+      (seller-amount (- sale-price fee-amount))
+      (new-trade-id (+ (var-get trade-counter) u1))
+      (current-buyer-vouchers (get voucher-ids (get-user-vouchers tx-sender)))
+    )
+    (asserts! (get active listing-data) ERR_VOUCHER_NOT_FOR_SALE)
+    (asserts! (not (is-eq tx-sender (get seller listing-data))) ERR_CANNOT_BUY_OWN_VOUCHER)
+    (asserts! (not (get redeemed voucher-data)) ERR_VOUCHER_ALREADY_REDEEMED)
+    (asserts! (> (get expiry-block voucher-data) stacks-block-height) ERR_VOUCHER_EXPIRED)
+    (process-referral-reward tx-sender sale-price "purchase")
+    (try! (stx-transfer? sale-price tx-sender (get seller listing-data)))
+    (map-set vouchers
+      { voucher-id: voucher-id }
+      (merge voucher-data { owner: tx-sender })
+    )
+    (map-set user-vouchers
+      { user: tx-sender }
+      { voucher-ids: (unwrap! (as-max-len? (append current-buyer-vouchers voucher-id) u100) ERR_INSUFFICIENT_BALANCE) }
+    )
+    (map-set marketplace-listings
+      { voucher-id: voucher-id }
+      (merge listing-data { active: false })
+    )
+    (map-set trade-history
+      { trade-id: new-trade-id }
+      {
+        voucher-id: voucher-id,
+        seller: (get seller listing-data),
+        buyer: tx-sender,
+        price: sale-price,
+        traded-at: stacks-block-height,
+        fee-paid: fee-amount
+      }
+    )
+    (var-set trade-counter new-trade-id)
+    (ok true)
+  )
+)
+
+(define-public (claim-referral-rewards)
+  (let
+    (
+      (stats (get-referrer-stats tx-sender))
+      (pending-amount (get pending-rewards stats))
+    )
+    (asserts! (> pending-amount u0) ERR_NO_REWARDS_AVAILABLE)
+    (try! (as-contract (stx-transfer? pending-amount tx-sender tx-sender)))
+    (map-set referrer-stats
+      { referrer: tx-sender }
+      {
+        total-referrals: (get total-referrals stats),
+        pending-rewards: u0,
+        claimed-rewards: (+ (get claimed-rewards stats) pending-amount)
+      }
+    )
+    (ok pending-amount)
+  )
+)
+
+(define-public (update-referral-reward-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-rate u2000) ERR_INVALID_AMOUNT)
+    (var-set referral-reward-rate new-rate)
     (ok true)
   )
 )
