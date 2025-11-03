@@ -814,3 +814,52 @@
     (ok true)
   )
 )
+
+(define-map voucher-approvals
+  { voucher-id: uint }
+  { approved: principal }
+)
+
+(define-public (approve-voucher (voucher-id uint) (spender principal))
+  (let
+    (
+      (voucher-data (unwrap! (get-voucher voucher-id) ERR_VOUCHER_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner voucher-data)) ERR_UNAUTHORIZED)
+    (map-set voucher-approvals { voucher-id: voucher-id } { approved: spender })
+    (ok true)
+  )
+)
+
+(define-read-only (get-approved (voucher-id uint))
+  (map-get? voucher-approvals { voucher-id: voucher-id })
+)
+
+(define-public (revoke-voucher-approval (voucher-id uint))
+  (let
+    (
+      (voucher-data (unwrap! (get-voucher voucher-id) ERR_VOUCHER_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner voucher-data)) ERR_UNAUTHORIZED)
+    (map-delete voucher-approvals { voucher-id: voucher-id })
+    (ok true)
+  )
+)
+
+(define-public (transfer-voucher-from (voucher-id uint) (from principal) (to principal))
+  (let
+    (
+      (voucher-data (unwrap! (get-voucher voucher-id) ERR_VOUCHER_NOT_FOUND))
+      (approval (map-get? voucher-approvals { voucher-id: voucher-id }))
+      (to-vouchers (get voucher-ids (get-user-vouchers to)))
+    )
+    (asserts! (is-eq from (get owner voucher-data)) ERR_UNAUTHORIZED)
+    (asserts! (or (is-eq tx-sender from) (match approval a (is-eq tx-sender (get approved a)) false)) ERR_UNAUTHORIZED)
+    (asserts! (not (get redeemed voucher-data)) ERR_VOUCHER_ALREADY_REDEEMED)
+    (asserts! (> (get expiry-block voucher-data) stacks-block-height) ERR_VOUCHER_EXPIRED)
+    (map-set vouchers { voucher-id: voucher-id } (merge voucher-data { owner: to }))
+    (map-set user-vouchers { user: to } { voucher-ids: (unwrap! (as-max-len? (append to-vouchers voucher-id) u100) ERR_INSUFFICIENT_BALANCE) })
+    (map-delete voucher-approvals { voucher-id: voucher-id })
+    (ok true)
+  )
+)
